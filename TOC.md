@@ -1,3 +1,12 @@
-# 목차
-
-* [01. 시작하기](pages/01-getting-started.md)
+- [0. 시작하기](pages/00-start.md)
+- [1. 제1부 기초 100제](pages/part1.md)
+  - [01. 출력의 첫걸음](pages/01.md)
+  - [02. 입력과 자료형](pages/02.md)
+  - [03. 산술 연산](pages/03.md)
+  - [04. 조건문](pages/04.md)
+  - [05. 논리 연산과 중첩 조건](pages/05.md)
+  - [06. for와 range](pages/06.md)
+  - [07. while과 반복의 제어](pages/07.md)
+  - [08. 중첩 반복](pages/08.md)
+  - [09. 문자열 다루기 Ⅰ](pages/09.md)
+  - [10. 문자열 다루기 Ⅱ: 메서드와 서식](pages/10.md)
