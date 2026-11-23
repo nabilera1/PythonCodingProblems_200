@@ -1,25 +1,52 @@
 """문제 데이터(problems/*.py) → 위키독스 원고(pages/), 목차(TOC.md), README.md, Colab 노트북(notebooks/) 생성.
 
-사용법:  python build.py
-- 모든 모범답안을 실제로 실행해 예제 출력과 일치하는지 검증하고,
-  숨은 테스트의 기대 출력을 자동으로 만듭니다. 하나라도 틀리면 빌드를 멈춥니다.
+사용법:  python build.py            # 전체 빌드
+         python build.py 151 175    # 해당 번호 범위만 검증(빠른 점검용, 파일은 쓰지 않음)
+
+검증 절차 (하나라도 어긋나면 빌드를 멈춥니다)
+1. 모범답안을 실제로 실행해 예제 출력과 일치하는지 확인
+2. 숨은 테스트의 기대 출력을 모범답안으로 생성 (G()로 만든 큰 입력 포함)
+3. 모범답안 실행 시간이 시간 제한의 절반을 넘지 않는지 확인 (Colab은 로컬보다 느리므로)
+4. brute(완전 탐색 풀이)와 stress(작은 무작위 입력 생성기)가 있으면 수백 개 입력으로 교차 검증
 """
-import importlib.util, json, pathlib, subprocess, sys, textwrap
+import hashlib, importlib.util, io, json, pathlib, subprocess, sys, time
 import config as C
 
 ROOT = pathlib.Path(__file__).parent
 PAGES, NB = ROOT / "pages", ROOT / "notebooks"
+sys.path.insert(0, str(ROOT))
+STRESS_N = 300
+HASH_OVER = 2000          # 기대 출력이 이보다 길면 노트북에는 해시만 저장
 
 
 def norm(s: str) -> str:
     return "\n".join(line.rstrip() for line in s.strip("\n").splitlines()).strip("\n")
 
 
-def run(code: str, inp: str) -> str:
-    r = subprocess.run([sys.executable, "-c", code], input=inp + "\n", capture_output=True, text=True, timeout=10)
+def run(code: str, inp: str, timeout=30):
+    t = time.perf_counter()
+    r = subprocess.run([sys.executable, "-c", code], input=inp + "\n", capture_output=True, text=True, timeout=timeout)
+    el = time.perf_counter() - t
     if r.returncode:
-        raise RuntimeError(r.stderr)
-    return norm(r.stdout)
+        raise RuntimeError(r.stderr[-2000:])
+    return norm(r.stdout), el
+
+
+def run_inproc(code: str, inp: str) -> str:
+    old_in, old_out = sys.stdin, sys.stdout
+    sys.stdin, buf = io.TextIOWrapper(io.BytesIO((inp + "\n").encode())), io.StringIO()
+    sys.stdout = buf
+    try:
+        exec(compile(code, "<code>", "exec"), {"__name__": "__main__"})
+    except SystemExit:
+        pass
+    finally:
+        sys.stdin, sys.stdout = old_in, old_out
+    return norm(buf.getvalue())
+
+
+def gen_input(gen_code: str) -> str:
+    return run_inproc(gen_code, "")
 
 
 def load_problems():
@@ -34,16 +61,38 @@ def load_problems():
     return probs
 
 
+def tl(p):
+    return p.get("time_limit", 2)
+
+
 def verify(p):
-    tests = []
+    pid, limit = p["id"], tl(p)
+    tests, worst = [], 0.0
     for i, (inp, out) in enumerate(p["examples"], 1):
-        got = run(p["solution"], inp)
+        got, el = run(p["solution"], inp)
         if got != norm(out):
-            sys.exit(f"[{p['id']:03d}] 예제 {i} 불일치\n기대: {out!r}\n실제: {got!r}")
-        tests.append([inp, norm(out), True])
-    for inp in p["hidden"]:
-        tests.append([inp, run(p["solution"], inp), False])
-    return tests
+            sys.exit(f"[{pid:03d}] 예제 {i} 불일치\n기대: {out!r}\n실제: {got!r}")
+        worst = max(worst, el)
+        tests.append([inp, norm(out), True, None])
+    for h in p["hidden"]:
+        if isinstance(h, dict):
+            inp = gen_input(h["gen"])
+            got, el = run(p["solution"], inp)
+            exp = got if len(got) <= HASH_OVER else "sha256:" + hashlib.sha256(got.encode()).hexdigest()
+            tests.append([None, exp, False, h["gen"]])
+        else:
+            got, el = run(p["solution"], h)
+            tests.append([h, got, False, None])
+        worst = max(worst, el)
+    if worst > limit / 2:
+        sys.exit(f"[{pid:03d}] 모범답안이 너무 느림: {worst:.2f}s (제한 {limit}s의 절반 초과)")
+    if p.get("brute"):
+        for seed in range(p.get("stress_n", STRESS_N)):
+            inp = gen_input(f"import random\nrandom.seed({seed})\n" + p["stress"])
+            a, b = run_inproc(p["solution"], inp), run_inproc(p["brute"], inp)
+            if a != b:
+                sys.exit(f"[{pid:03d}] 스트레스 테스트 불일치 (seed {seed})\n입력:\n{inp}\n모범: {a!r}\n완전탐색: {b!r}")
+    return tests, worst
 
 
 # ───────────────────────── 위키독스 원고 ─────────────────────────
@@ -60,10 +109,17 @@ def fence(text, lang=""):
     return f"```{lang}\n{text}\n```"
 
 
-def problem_md(p, with_answers=True):
+def problem_md(p, part, with_answers=True):
     out = [f"## {p['id']:03d}. {p['title']}", "", p["story"], "", f"**문제** {p['task']}", ""]
-    if p.get("constraints"):
-        out += [f"**제한** {p['constraints']}", ""]
+    if p.get("input_desc"):
+        out += [f"**입력** {p['input_desc']}", ""]
+    if p.get("output_desc"):
+        out += [f"**출력** {p['output_desc']}", ""]
+    cons = p.get("constraints")
+    if part == "경시":
+        cons = (cons + ", " if cons else "") + f"시간 제한 {tl(p)}초"
+    if cons:
+        out += [f"**제한** {cons}", ""]
     for i, (inp, o) in enumerate(p["examples"], 1):
         n = f" {i}" if len(p["examples"]) > 1 else ""
         if inp:
@@ -84,12 +140,11 @@ def answers_md(p, heading=False):
 
 def page_md(page, probs):
     no, part, name, start = page
-    ids = range(start, start + 5)
     out = [f"# {no:02d}. {name}", "",
            f"> {part} · 문제 {start:03d}–{start + 4:03d} · Python {C.PYTHON_TARGET} 기준", "",
            f"{badge(no)} ← 이 단원의 문제를 Colab에서 풀고 바로 채점할 수 있습니다.", "", "---", ""]
-    for i in ids:
-        out += problem_md(probs[i], with_answers=(C.HIDE_MODE == "details")) + ["---", ""]
+    for i in range(start, start + 5):
+        out += problem_md(probs[i], part, with_answers=(C.HIDE_MODE == "details")) + ["---", ""]
     return "\n".join(out)
 
 
@@ -103,32 +158,49 @@ def answer_page_md(page, probs):
 
 # ───────────────────────── Colab 노트북 ─────────────────────────
 CHECKER = '''
-import subprocess, sys, pathlib
+import subprocess, sys, pathlib, hashlib
+
+_GEN_CACHE = {}
 
 def _norm(s):
     return "\\n".join(l.rstrip() for l in s.strip("\\n").splitlines()).strip("\\n")
 
-def check(pid, time_limit=2.0):
+def _input_of(inp, gen):
+    if gen is None:
+        return inp
+    if gen not in _GEN_CACHE:
+        _GEN_CACHE[gen] = subprocess.run([sys.executable, "-c", gen], capture_output=True, text=True).stdout
+    return _GEN_CACHE[gen]
+
+def check(pid):
     """p{번호}.py 를 모든 테스트로 실행해 채점합니다."""
     path = pathlib.Path(f"p{pid:03d}.py")
     if not path.exists():
         print(f"먼저 위의 %%writefile p{pid:03d}.py 셀을 실행하세요."); return
+    limit = TL[pid]
     ok = 0
-    for i, (inp, exp, shown) in enumerate(TESTS[pid], 1):
+    for i, (inp, exp, shown, gen) in enumerate(TESTS[pid], 1):
         tag = f"예제 {i}" if shown else f"숨은 테스트 {i}"
+        data = _input_of(inp, gen)
         try:
-            r = subprocess.run([sys.executable, str(path)], input=inp + "\\n",
-                               capture_output=True, text=True, timeout=time_limit)
+            r = subprocess.run([sys.executable, str(path)], input=data.rstrip("\\n") + "\\n",
+                               capture_output=True, text=True, timeout=limit)
         except subprocess.TimeoutExpired:
-            print(f"⏱ {tag}: 시간 초과 ({time_limit}초)"); continue
+            print(f"⏱ {tag}: 시간 초과 ({limit}초)"); continue
         got = _norm(r.stdout)
+        if exp.startswith("sha256:"):
+            got_cmp = "sha256:" + hashlib.sha256(got.encode()).hexdigest()
+        else:
+            got_cmp = got
         if r.returncode:
             last = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "알 수 없는 오류"
             print(f"💥 {tag}: 실행 오류 → {last}")
-        elif got == exp:
+        elif got_cmp == exp:
             ok += 1; print(f"✅ {tag}")
         elif shown:
             print(f"❌ {tag}\\n   입력: {inp!r}\\n   기대: {exp!r}\\n   실제: {got!r}")
+        elif gen is not None:
+            print(f"❌ {tag}  (큰 입력)")
         else:
             print(f"❌ {tag}  (입력: {inp[:60]!r})")
     total = len(TESTS[pid])
@@ -149,20 +221,30 @@ def code_cell(src, hidden=False):
 def notebook(page, probs, tests):
     no, part, name, start = page
     ids = list(range(start, start + 5))
+    extra = ("\n\n> 제3부의 시간 제한은 Colab 기준입니다. 숨은 테스트에는 제한 범위의 큰 입력이 들어 있으므로, "
+             "효율이 낮은 풀이는 '시간 초과'가 납니다." if part == "경시" else "")
     cells = [md_cell(f"# {no:02d}. {name}\n\n{part} · 문제 {start:03d}–{start + 4:03d}\n\n"
                      "**사용법**\n1. 바로 아래 **🔧 채점기 준비** 셀을 먼저 실행합니다(▶).\n"
                      "2. 각 문제의 `%%writefile` 셀에 코드를 작성하고 실행하면 파일로 저장됩니다.\n"
                      "3. 그 아래 `check(번호)` 셀을 실행하면 채점됩니다.\n"
                      "4. 직접 입력을 넣어 실행해 보려면 새 셀에 `%run p001.py`처럼 입력합니다.\n\n"
-                     "> 정답과 해설은 위키독스 본문의 접힌 상자에 있습니다. 충분히 고민한 뒤에 펼쳐 보세요.")]
+                     "> 정답과 해설은 위키독스 본문의 접힌 상자에 있습니다. 충분히 고민한 뒤에 펼쳐 보세요." + extra)]
     tdict = {i: tests[i] for i in ids}
-    cells.append(code_cell("#@title 🔧 채점기 준비 (먼저 실행하세요)\n" + f"TESTS = {tdict!r}\n" + CHECKER.strip() + "\nprint('채점기 준비 완료!')",
-                           hidden=True))
+    tls = {i: tl(probs[i]) for i in ids}
+    cells.append(code_cell("#@title 🔧 채점기 준비 (먼저 실행하세요)\n" + f"TESTS = {tdict!r}\nTL = {tls!r}\n"
+                           + CHECKER.strip() + "\nprint('채점기 준비 완료!')", hidden=True))
     for i in ids:
         p = probs[i]
         body = [f"## {i:03d}. {p['title']}", "", p["task"]]
-        if p.get("constraints"):
-            body += ["", f"**제한** {p['constraints']}"]
+        if p.get("input_desc"):
+            body += ["", f"**입력** {p['input_desc']}"]
+        if p.get("output_desc"):
+            body += ["", f"**출력** {p['output_desc']}"]
+        cons = p.get("constraints")
+        if part == "경시":
+            cons = (cons + ", " if cons else "") + f"시간 제한 {tl(p)}초"
+        if cons:
+            body += ["", f"**제한** {cons}"]
         for k, (inp, o) in enumerate(p["examples"], 1):
             body += ["", f"**예제 {k}**"]
             if inp:
@@ -221,25 +303,39 @@ Colab의 기본 파이썬 버전은 {C.PYTHON_TARGET}입니다. 이 책의 모�
 
 - 입력은 `input()`으로 받고, `input("숫자: ")`처럼 안내 문구를 넣지 않습니다.
 - 출력은 예제와 **글자 하나까지** 같아야 합니다. (줄 끝 공백은 무시합니다.)
-- 제3부에서는 빠른 입력을 위해 `sys.stdin.readline`을 씁니다.
+- 제3부에서는 빠른 입력을 위해 `input = sys.stdin.readline`을 씁니다. 이때 읽은 줄 끝에는 줄바꿈 문자가 남으므로, 문자열로 쓸 때는 `.rstrip()`을 붙입니다.
+
+## 제3부를 위한 파이썬 실전 수칙
+
+- 시간 제한은 파이썬 기준으로 넉넉히 잡았지만, 반복문 안의 불필요한 연산은 그대로 시간이 됩니다.
+- 깊은 재귀는 `sys.setrecursionlimit`이 필요하고 느리므로, 가능하면 반복문과 스택으로 바꿉니다.
+- 출력할 줄이 많으면 `print("\\n".join(...))`로 한 번에 출력합니다.
 """
 
 
-def build():
+def build(lo=None, hi=None):
     probs = load_problems()
+    if lo is not None:
+        for i in sorted(probs):
+            if lo <= i <= hi:
+                _, w = verify(probs[i])
+                print(f"  {i:03d} 통과 (최대 {w:.2f}s)")
+        return
     PAGES.mkdir(exist_ok=True); NB.mkdir(exist_ok=True)
-    tests, built = {}, []
+    tests, built, slow = {}, [], []
     for page in C.CURRICULUM:
         ids = range(page[3], page[3] + 5)
         if not all(i in probs for i in ids):
             continue
         for i in ids:
-            tests[i] = verify(probs[i])
+            tests[i], w = verify(probs[i])
+            slow.append((w, i))
         (PAGES / f"{page[0]:02d}.md").write_text(page_md(page, probs), encoding="utf-8")
         if C.HIDE_MODE == "separate":
             (PAGES / f"{page[0]:02d}-answers.md").write_text(answer_page_md(page, probs), encoding="utf-8")
         (NB / f"{page[0]:02d}.ipynb").write_text(json.dumps(notebook(page, probs, tests), ensure_ascii=False, indent=1), encoding="utf-8")
         built.append(page)
+        print(f"  {page[0]:02d}. {page[2]} 완료")
     (PAGES / "00-start.md").write_text(START_MD, encoding="utf-8")
 
     parts = {"기초": ("1. 제1부 기초 100제", "part1"), "응용": ("2. 제2부 응용 50제", "part2"),
@@ -264,8 +360,13 @@ def build():
               "모든 문제는 Google Colab에서 자동 채점됩니다.", "",
               "저자: 김동균"]
     (ROOT / "README.md").write_text("\n".join(readme) + "\n", encoding="utf-8")
-    print(f"빌드 완료: {len(built)}개 단원, {len(built) * 5}문제, 테스트 {sum(len(v) for v in tests.values())}개 검증")
+    n_tests = sum(len(v) for v in tests.values())
+    print(f"빌드 완료: {len(built)}개 단원, {len(built) * 5}문제, 테스트 {n_tests}개 검증")
+    print("가장 느린 모범답안:", ", ".join(f"{i:03d}({w:.2f}s)" for w, i in sorted(slow, reverse=True)[:5]))
 
 
 if __name__ == "__main__":
-    build()
+    if len(sys.argv) == 3:
+        build(int(sys.argv[1]), int(sys.argv[2]))
+    else:
+        build()

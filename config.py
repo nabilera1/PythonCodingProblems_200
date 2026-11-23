@@ -1,6 +1,6 @@
 # 사이트 전체 설정 — 저장소 이름이 정해지면 이 파일만 고치면 됩니다.
 GITHUB_OWNER = "nabilera1"
-GITHUB_REPO = "python-200"          # 위키독스 '깃허브 책 만들기'에서 정한 저장소 이름
+GITHUB_REPO = "PythonCodingProblems_200"
 GITHUB_BRANCH = "main"
 BOOK_TITLE = "구글 계정 하나로 시작하는 파이썬 200제"
 PYTHON_TARGET = "3.12"              # Google Colab 기본 런타임 기준
