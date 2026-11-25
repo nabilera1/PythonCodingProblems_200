@@ -16,3 +16,7 @@
 자, 첫 문제를 펼쳐 볼까요? 문제를 천천히 읽고, 손으로 풀 수 있는 가장 작은 예시부터 만들어 봅시다.
 
 교사 김동균
+(전 대구과학고등학교, 전 대구SW마이스터고등학교...)
+현 김해수남고등학교 
+https://teacher.wikidocs.net/
+https://blog.naver.com/nabilera1
